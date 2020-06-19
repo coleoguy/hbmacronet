@@ -1,0 +1,14 @@
+
+input tree: a bd tree with speciation and exctinction of 1 and 0.1 respectively.
+	    100 trees created with 50 taxa each
+
+ms: 	sampled 20 times to represent 20 genes 
+
+ms hybridization: 10 hybridizations, strength of 50, uniformly picked throughout specified time, picked hybridization pairs with added wieght towards recently species with a closer MRCA.
+	clade hybridization: smallest clade that includes atleast 25% of tips was chosen. time from clade birth to present
+	control: no hybridization
+
+seq gen:HKY85 model of evoultion.4000bp simulated, 200bp per gene. 0.01 scaling factor
+
+MrBayes: ran for 25,000 generations with a 25% burn-in. 
+	 HKY85 model of evoultion. Gamma-distributed rates across sites 

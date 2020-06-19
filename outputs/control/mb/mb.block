@@ -1,0 +1,9 @@
+begin mrbayes;
+set autoclose=yes nowarn=yes;
+execute ../output/seq.gen/dna_tree.100.nex;
+lset nst=2 rates=gamma;
+prset brlenspr=clock:uniform;
+mcmc ngen=25000 samplefreq=10 file=../output/mb/tree100;
+sumt Conformat=simple;
+end;
+

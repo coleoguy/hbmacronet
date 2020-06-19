@@ -1,0 +1,100 @@
+
+# This script will slowly be built up to become our primary
+# pipeline for the production of posterior distribtuions of 
+# trees and the associated DNA alignement they were inferred from
+#
+#
+# This is just a reporting flag when turned on the script will save
+# intermediate results for record keeping or troubleshooting
+reporting <- F
+#
+#
+#
+#############
+# 1 Diversitree - produces phylo trees
+#############
+library(diversitree)
+# here we generate 100 trees each with 50 taxa 
+# using a speciation rate of 1 and extinction rate of .1
+taxa <- 50   # the number of taxa on each tree
+ntrees <- 100  # the number of simulated trees
+
+trees <- trees(pars = c(1, .1), max.taxa = taxa, type = "bd", n = ntrees)
+rm(taxa, ntrees)
+
+###############
+# 2 phylo -> MS - produces strings for MS
+###############
+source("getMS.R")
+ngenes <- 20  # number of gene tree samples to produce
+
+ms.strings <- vector()
+for(i in 1:length(trees)){
+  ms.strings[i] <- getMS(tree = trees[[i]], samps = ngenes, report = "T")
+}
+if(reporting == T) write(ms.strings, file = "ms.strings.txt")
+
+#############
+# 3 MS - produces samples of possible gene trees
+#############
+# when we start calling other programs you will need to make
+# sure that the executable is in your system path
+bp <- 200 # the number of nuceleotides we want to simulate in seqGen
+
+for(j in 1:length(ms.strings)){
+  z <-system(command = paste("ms ", ms.strings[j],
+                             "|tail +4 | grep -v // ",
+                             sep = ""), intern=T)
+  # this next loop adds a bit of text in front of tree to
+  # define the number of bp to simulate based on it
+  for(i in 1:length(z)){ 
+    if(z[i] != "") z[i] <- paste("[", bp, "]", z[i], sep = "")
+  }
+  write(z, file=paste("../output/ms/gene.trees.tree.", j, ".txt", sep = ""))
+}
+
+#############
+# 4 SeqGen
+#############
+alignment.length <- 4000 # total length of desired alignment
+# rather than reformatting the data it is now saved in nexus format
+# MrBayes should handle this without reformatting
+for(i in 1:length(trees)){
+  # argument s is the scaling factor and if the alignments are all noisy
+  # then we should make this value smaller to reduce the effective mutation rate.
+  system(command = paste("seq-gen -mHKY -l ",alignment.length,
+                         " -s 0.01 -on -p ",
+                         ngenes, " < ../output/ms/gene.trees.tree.", i,
+                         ".txt > ../output/seq.gen/dna_tree.", i, ".nex", sep=""))
+}
+
+
+
+############
+# 7 MrBayes - produces a posterior distribution of trees
+############
+# we will create mb block for each run that will have all settings 
+# for a given run
+# if split frequencies are larger than .01 then we should make this value larger
+gens <- 2000 # generations for mcmc
+
+for(i in 1:length(trees)){
+  mb.block <- paste("begin mrbayes;\n",                 # identifies thsi as control block
+                    "set autoclose=yes nowarn=yes;\n",  # close MB when done
+                    "execute ../output/seq.gen/dna_tree.", i, ".nex;\n",   # this is our DNA from seqgen
+                    "lset nst=2 rates=gamma;\n",        # sets of the DNA model
+                    "prset brlenspr=clock:uniform;\n",  # make our tree ultrametric
+                    "mcmc ngen=", gens, " samplefreq=10 file=../output/mb/tree", i, ";\n",  # sets up the mcmc and save files
+                    "sumt;\n",                          # summarizes trees
+                    "end;\n", sep = "")
+  write(mb.block, file="../output/mb/mb.block")
+  system(command = "mb ../output/mb/mb.block")
+}
+
+####################
+# process trees
+####################
+
+# need to still write some code to take final trees
+# downsample to 100 trees for trait analysis
+

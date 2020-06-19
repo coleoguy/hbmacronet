@@ -1,0 +1,558 @@
+---
+title: "Tree Analyses"
+author: "Josh Justison"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+---
+
+```{r include=FALSE}
+library(BMhyd)
+library(diversitree)
+library(phytools)
+source("../Rscripts/getMS.R")
+library(dplyr)
+library(coda)
+library(imager)
+ntrees<-5
+nposterior<-2501
+treeburn<-0.25 ## percentage of trees to toss as burn in
+start<-ceiling(treeburn*nposterior)
+
+load("myfile.RData")
+
+# This function checks trees to see if they pass ape ultrametricity test.
+# If not, it computes the differential root-to-tip distance across all tips.
+# It adds the appropriate quantity to each terminal branch length to ensure that 
+# tree passes ultrametric test.
+# Note: this is only a valid method of making trees ultrametric when the 
+# 	non-ultrametricity is due to small numerical discrepancies, e.g., 
+#   rounding or other floating point issues during phylogeny construction.
+# 
+# written by Dan Rabosky
+check_and_fix_ultrametric <- function(phy){
+  if (!is.ultrametric(phy)){
+    vv <- vcv.phylo(phy)
+    dx <- diag(vv)
+    mxx <- max(dx) - dx
+    for (i in 1:length(mxx)){
+      phy$edge.length[phy$edge[,2] == i] <- phy$edge.length[phy$edge[,2] == i] + mxx[i]
+    }
+    if (!is.ultrametric(phy)){
+      stop("Ultrametric fix failed\n")
+    }	
+  }
+  return(phy)
+}
+```
+
+##Big Picture
+  Learning about the evolutionary history of organisms is pretty neat, there are all sorts of of applications that range from the fields of ecology to virology, to understanding how certain traits evolved. Typically we infer evolutionary histories as bifurcating trees. However, things like lateral gene transfer, incomplete lineage sorting, and introgression may give make species histories appear to take on a more reticulate form.
+  
+  We are hoping to learn whether these sorts of events, particularly introgression, will have an impact on any downstream macroevolutionary analyses such as trait evolution and diversification.
+  
+###Brief overview of the Pipeline
+  First, input trees were generated from a birth-death process as outlined in diversitree. These are the trees that get run thru the pipeline, both with and without introgression events.
+ 
+  I'm going to abstract out most of the details of the 'pipeline' for now, I may save that writing for another place. For an oversimplification that grossly undermines the beauty of the pipeline,the input trees and introgression records jump thru a bunch of hoops to make it unrecognizable without tree inference; we then get MrBayes to spit out its best guess of what the input trees should look like.
+  
+  Below should be a high-level map of the pipeline:
+
+```{r, include=FALSE}
+im<-load.image("Pipeline.png")
+plot(im,axes = F)
+```
+
+###Parameters
+Here are the parameters used at each step of the pipeline:
+
+
+input tree: a bd tree with speciation and exctinction of 1 and 0.1 respectively.
+	    100 trees created with 50 taxa each
+
+
+ms hybridization: 5 hybridizations, 
+		  strength of 20, 
+	          uniformly picked throughout specified time, 
+		  picked hybridization pairs with added wieght towards recently species with a closer MRCA.
+
+	recent hybridization: events occur during most recent 10% of time on tree
+	distant hybridization: events occur during most distant 10% of tree
+	clade hybridization: smallest clade that includes atleast 25% of tips was chosen. time from clade birth to present
+	control: no hybridization
+
+ms: 	sampled 20 times to represent 20 genes 
+
+seq gen: HKY85 model of evoultion. 4000bp simulated, 200bp per gene. 0.01 scaling factor
+
+MrBayes: ran for 25,000 generations, sample every 100th generation, 25% burn-in. 
+	 HKY85 model of evoultion. Gamma-distributed rates across sites
+	 Generates two chains of 2501 posterior trees
+
+
+
+MCMC in R: Fit posterior trees to a some BD likelihood function.
+	   Ran MCMC for 1000 generations, took no burn-in
+           took initial parameters of 1 for speciation and 0.1 for extinction.
+
+  
+  
+###Choosing Introgression Events - Clade
+  The events are first determined by locating the smallest clade that contains at least 25% of the species. Next,within the time of the clade, a random point of time is picked for an introgression event. Each possible introgression event at the determined time is weighted based off of the time from the MRCA for the species pair at that time. Rinse and repeat until you have your desired amount of introgression events, we went with 5.
+  We are aiming to have more events be between species that more recently diverged, however, the wieghting is a bit wonky and only does this to a certain degree. It's on the laundry list of things to do but let's not get too bogged down with that now.
+  
+  
+
+##Intro code and Usage of Data
+  This is Just some procedural code to read in all of the data and whatnot needed for analysis.There's input data and Mrbayes output data for 100 trees but downstream analyses were only done for the first 5 trees for now so we'll only read the first 5 sets for everything.
+  
+###Reading Inputs
+The input trees are stored in a list.
+The hybrid records for each input tree as stored as data frames within a list. They include the 'donor' and 'recipient' for each event, the percentage of genetic material transfered, and the time of the event. 
+```{r}
+# ##read input trees 
+# input<-read.nexus("../input/trees")
+# input_trees<-list()
+# for( i in 1:5){
+#   input_trees[[i]]<-input[[i]]
+#   input_trees[[i]]$tip.label<-getMS(input_trees[[i]],1,"T",new.names = T)[[2]][,2]  ## rename tips to match the new tip labels ##TODO do this and then save the trees
+#   input_trees[[i]]$tip.label<-as.character(input_trees[[i]]$tip.label)
+# }
+# 
+# #read hybrid records for clades
+# ## things need to get reformatted so they work with certain functions ##TODO reformat the data frame before saving
+# hybrids<-list()
+# for(i in 1:5){
+#   hy<-read.csv(paste("../hybridizations/hybrid_clade/hybrid",i,".csv",sep = ""))[-1]
+#   hy[,5]<-max(branching.times(input_trees[[i]]))-hy[,3]
+#   hy[,3]<-hy$str
+#   hy[,4]<-hy[,5]
+#   hy[,1]<-as.character(hy[,1])
+#   hy[,2]<-as.character(hy[,2])
+#   hybrids[[i]]<-hy
+#   colnames(hybrids[[i]])<-c("donor","recipient","m","time.from.root.donor","time.from.root.recipient")
+# }
+```
+###Reading Output Trees
+  
+  We are concerned with two different MrBayes outputs for a given input tree, the concensus tree and the set of posterior trees. The concensus trees are stored in a list of trees while the posterior sets are stored in a list of lists where the i-th list contains a list of j posterior trees. The concensus trees were used for graphing purposes while the posterior sets were used for downstream macroevolutionary analyses.
+  Posterior outputs from Mrbayes include runs from two chains. Currently only one chain is being read as the two chains should be relatively converged. A more complete analysis will include both chains, another item for the laundry list.
+```{r}
+# ###Reading posterior sets first
+# 
+# ##read control trees and make ultrametric
+# control_trees<-list()
+# for(i in 1:5){
+#   # control_trees[[i]]<-c(read.nexus(file = paste("../outputs/output_control/mb/tree",i,".run1.T",sep = "")),read.nexus(file = paste("../outputs/output_control/mb/tree",i,".run2.T",sep = ""))) ##This reads both chains
+#   control_trees[[i]]<-read.nexus(file = paste("../outputs/output_control/mb/tree",i,".run1.T",sep = "")) ## This reads one chain
+#   for(j in 1:length(control_trees[[i]])){
+#     control_trees[[i]][[j]]<-check_and_fix_ultrametric(control_trees[[i]][[j]])
+#   }
+# }
+# ##read clade trees and make ultrametric
+# 
+# clade_trees<-list()
+# for(i in 1:5){
+#   #clade_trees[[i]]<-c(read.nexus(file = paste("../outputs/output_clade/mb/tree",i,".run1.T",sep = "")),read.nexus(file = paste("../outputs/output_control/mb/tree",i,".run2.T",sep = "")))
+#   clade_trees[[i]]<-read.nexus(file = paste("../outputs/output_clade/mb/tree",i,".run1.T",sep = ""))
+#   for(j in 1:length(clade_trees[[i]])){
+#     clade_trees[[i]][[j]]<-check_and_fix_ultrametric(clade_trees[[i]][[j]])
+#   }
+# }
+# ###Read Concensus trees
+# 
+# ##read control concensus trees
+# con_control_trees<-list()
+# for(i in 1:5){
+#   con_control_trees[[i]]<-read.nexus(file = paste("../outputs/output_control/mb/tree",i,".con.tre",sep = ""))[[1]]
+# }
+# ##read clade concensus trees
+# con_clade_trees<-list()
+# for(i in 1:5){
+#   con_clade_trees[[i]]<-read.nexus(file = paste("../outputs/output_clade/mb/tree",i,".con.tre",sep = ""))[[1]]
+# }
+```
+
+###Reading Output MCMCs 
+Out of 2501 posterior trees per input tree, we read trees 626 to 2051. We throw out the first 25% as burn-in.
+```{r}
+# ##read control bd mcmcs 
+# control_mcmc<-rep( list(list()), ntrees ) 
+# for(i in 1:ntrees){
+#   for(j in start:nposterior){
+#     control_mcmc[[i]][[j]]<-read.csv(paste("../outputs/output_control/mcmc_bd/tree",i,"/tree",i,"mcmc",j,".csv",sep=""))
+#   }
+# }
+# ##read clade bd mcmcs 
+# clade_mcmc<-rep( list(list()), ntrees ) 
+# for(i in 1:ntrees){
+#   for(j in start:nposterior){
+#     clade_mcmc[[i]][[j]]<-read.csv(paste("../outputs/output_clade/mcmc_bd/tree",i,"/tree",i,"mcmc",j,".csv",sep=""))
+#   }
+# }
+# ##read control split mcmcs 
+# split_control_mcmc<-rep( list(list()), ntrees ) 
+# for(i in 1:ntrees){
+#   for(j in start:nposterior){
+#     split_control_mcmc[[i]][[j]]<-read.csv(paste("../outputs/output_control/mcmc_split/tree",i,"/tree",i,"mcmc",j,".csv",sep=""))
+#   }
+# }
+# ##read clade split mcmcs 
+# split_clade_mcmc<-rep( list(list()), ntrees ) 
+# for(i in 1:ntrees){
+#   for(j in start:nposterior){
+#     split_clade_mcmc[[i]][[j]]<-read.csv(paste("../outputs/output_clade/mcmc_split/tree",i,"/tree",i,"mcmc",j,".csv",sep=""))
+#   }
+# }
+# 
+# ##bind  mcmcs together
+# bound_control<-list()
+# bound_clade<-list()
+# split_bound_control<-list()
+# split_bound_clade<-list()
+# for(i in 1:ntrees){
+#   bound_control[[i]]<-bind_rows(control_mcmc[[i]])
+#   bound_clade[[i]]<-bind_rows(clade_mcmc[[i]])
+#   split_bound_control[[i]]<-bind_rows(split_control_mcmc[[i]])
+#   split_bound_clade[[i]]<-bind_rows(split_clade_mcmc[[i]])
+# }
+
+
+```
+
+ 
+###Viewing the trees
+ let's view the  first input tree, marking any appropriate reticulate events:
+```{r echo=FALSE}
+PlotNetwork(input_trees[[1]],flow=hybrids[[1]],cex=0.5)
+```
+
+What a beaut. Judging from this picture the tips in the clade of introgression are: 
+31 32 37 5  6  26 27 47 30 22 20 21 39 40
+
+We'll look at this more later when we have other things to look at along with it.
+
+##Sanity Check of Pipeline
+Let's compare the input tree to the control tree. Having the trees be relatively similar is what we would expect because there's no funny business going on during the pipeline to do anything major to the inference.
+
+The first input tree is on the left while the first control concensus tree is on the right
+```{r echo=FALSE}
+co<-cophylo(input_trees[[1]],con_control_trees[[1]])
+plot(co)
+```
+
+Looks pretty good! Now the topology isn't perfect and there are a few polytomies but it looks pretty decent for now. One thing to note is that all of the branches along the tips appear to be systematically longer than what they are as in the inputs; this will be a laundry list item to address later.
+
+
+##Comparing Control to the experimental 
+Now that we know the pipline seems to generate sane trees for the control, let's compare the control trees to the trees with clade wide introgression events:
+
+```{r echo=FALSE}
+co<-cophylo(con_control_trees[[1]],con_clade_trees[[1]])
+plot(co)
+```
+
+  The control tree is on the left while the reticulate tree is on the right.
+The cophylo plotting function turns off the graphing window so it makes it tricky to add labels directly to these type of graphs. I'll add looking into adding labels low on my laundry list.
+  
+  As for comparing these two trees, they do appear to be pretty similar in areas where no introgression is believed to have taken place. The funkiness towards the top of the tree just appears to be the function having some difficulty rotating nodes properly due to a polytomy, this seems to happen often with polytomies.
+  
+  Interestingly the clade with introgression events (all descendents of the MRCA of 37 and 5) seemed to show some discord between topologies between the experimental and the control.Perhaps even more interestingly, 31 jumped from having the closest MRCA with 37 and 32 to having the closest MRCA with 26 and 27. This is exciting and somewhat alarming. It is exciting becuase if you recall from the input tree graph, there was an event happening between 31 and 26 which would imply that the events could be modelling like we hope they would. However, it is slightly alarming because 31 moved when the event was a introgression from 31 to 26. I suppose the directionality of the event doesn't necessarily dictate which tip would be relocated but I will look over my code to ensure I'm not misrepresenting the directionality.
+  
+##Looking at Speciation and Extinction
+  Each of the posterior trees were fit to various birth-death models to get likelihood functions. These functions were then put thru an mcmc to get parameter estimates of speciation and extinction. All of the posterior trees' mcmcs for a given input tree were then concatonated to get the distribution of parameter estimates. Currently the two models being assesed are a birth-death model and a birth-death model where specified clades can have different rates 
+
+
+
+###MCMC adequacy 
+  Before I get into the results themselves, it is probably appropriate to assess whether enough care was put into the mcmc to consider them valid results.
+  
+  Each posterior tree was run thru an mcmc for 1000 steps, let's start by looking at one of the runs for a posterior control tree put under a simple birth-death model:
+```{r}
+##lets look at the mcmc for the 1000th posterior tree
+ww<-coda::mcmc(control_mcmc[[1]][[1000]][,-1])
+summary(ww)
+plot(ww)
+print(effectiveSize(ww))
+```
+
+  It all looks like a hairy catapillar to me, and this is without taking any burn in. The hairy catipillar trend generally holds true for other posterior trees as well. If burn-in is deemed more needed, I may try implementing one of the diagnostics outlined here: <http://sbfnk.github.io/mfiidd/mcmc_diagnostics.html#33_burn-in>
+  
+Otherwise, another option they mentioned was looking for the peak of the plot between burn-in amount and effective sample size. 
+  
+  I may need to try different starting parameters just to ensure that it isn't stuck in the mud where it started. The effective sample size may seem small but adding more iterations doesn't seem to be any more informative than 1000 steps. Let's see what happens when we do 10000 steps, and heck, we can try some different parameters too:
+```{r}
+#bd mcmc  for control tree 
+tree<-control_trees[[1]][[1000]]
+tree$edge.length<-tree$edge.length/max(branching.times(tree))
+lk<-make.bd(tree = tree)
+w<- diff(sapply(control_mcmc[[1]][[1000]][2:3], range))
+y<-diversitree::mcmc(lik=lk,c(10,1),nsteps = 10000,w=0.1,print.every=0)
+qq<-coda::mcmc(as.data.frame(y[,-1]))
+summary(qq)
+plot(qq)
+
+```
+
+  It would appear that even when increasing the initial parameters and the number of steps by a magnitude of 10 we converge on the same location as when we had only 1000 steps.
+
+  Now that it appears the individual runs are going smoothly, let's concatonate all of them together and see what is going on:
+```{r}
+bb<-coda::mcmc(as.data.frame(bound_control[[1]][,-1]))
+summary(bb)
+plot(bb)
+```
+
+  Not sure what to make of this one, it's not quite as hairy catapillar-looking but I'm not sure that's the worst. It might be expected that the parameters aren't always predicted the same since they're different trees. I might need some help making sense of this, if it is even informative to look at.
+  
+  The birth-death model that allows split rates also had catapillar-like plots when looking within a posterior tree and less fuzzy plots for each set of posterior trees. 
+  These trends continue for other input trees as well for both models.
+
+##Making Sense of the MCMCs
+  Assuming that this is an OK process and valid data, let's then compare the parameter estimates for this output against the experimental and see whether introgression generates different rate estimates in either model.
+  
+###Birth Death Model 
+  First up is the Birth Death model:
+  
+```{r echo=FALSE}
+par(mfrow=c(2,2))
+profiles.plot(bound_control[[1]]$lambda,col.line = "red",xlab = "lambda")
+profiles.plot(bound_control[[1]]$mu,col.line = "red",xlab = "mu")
+
+profiles.plot(bound_control[[1]]$lambda,col.line = "red",xlab = "lambda")
+profiles.plot(bound_control[[1]]$mu,col.line = "red")
+
+profiles.plot(bound_clade[[1]]$lambda,col.line = "blue")
+profiles.plot(bound_clade[[1]]$mu,col.line = "blue")
+
+
+
+```
+
+Things don't look all that different but that's okay. One reason for this may be that any signal that the introgression may generate would just get covered up by everything else since the whole tree only has one rate a piece to describe the speciation and extinction.
+
+###Split Birth Death Model
+
+  One issue with the split birth death model is that we need to identify a node that gets the separate rates. In theory this is easy, the clade that experiences introgression would get separate rates. In the input tree this is very easy, all we have to do is find the MRCA of all species that participated in a reticulate event and get all of the descendents of that MRCA to identify the correct clade. However, when you are looking at a posterior tree from MrBayes, the clade that was identified from the input tree may not be all together or other species may have joined that clade, making it hard to identify. 
+ 
+  My attempt at a solution for correctly identifying the node for separate rates is to weight every node based off of what species are inside them. Species that were identified by the input tree get a score of +1 while all other species get a score of -1. if any nodes recieve the same score then the node with more species is picked, this is done to potentially include more species. This process should identify the clade with the most correct species while minimizing species that do not belong. Here is the code I used to try and identify the correct node for the split model:
+
+```{r eval = FALSE}
+
+###find smallest node that fits with all hybrid events 
+bfit<-list()
+bnode<-list()
+for(i in 1:1){
+  hy<-hybrids[[i]]
+  tree<-input_trees[[i]]
+  hyspecies<-as.numeric(unique(c(hy$donor,hy$recipient))) ##get all recorded tips that are involved in events
+  bfit[[i]]<-rep(NA,tree$Nnode*2)
+  for(j in (tree$Nnode+2):(tree$Nnode+50)){ ## look at each node in the tree
+    desc<-as.numeric(get.descendants(j,tree))
+    temp<-as.numeric(tree$tip.label[desc[desc<=length(tree$tip.label)]])
+    if(all(hyspecies %in% temp) & (length(temp)<length(bfit[[i]])) ){
+      bfit[[i]]<-temp
+      bnode[[i]]<-j
+    }
+  }
+  
+}
+##Tries to find a clade that is close to the one identified from the input hybrid events Nodes will be scored with a +1 for having a correct species and -1 for having an incorrect species if two nodes tie then the node with more species will be taken
+bclade_tips<-rep(list(list()),length(clade_trees))
+bclade_node<-rep(list(list()),length(clade_trees))
+for(i in 1:1){ ## Do this for each group of output trees
+  for(j in 1:length(clade_trees[[i]])){ ##Do this for each posterior output tree of a group
+    tree<-clade_trees[[i]][[j]]
+    bscore<-(-Inf)
+    for(k in (tree$Nnode+2):(2*tree$Nnode+1)){ ##Look at each node in the tree
+      ##get all tips for a node 
+      desc<-as.numeric(get.descendants(k,tree))
+      desc<-as.numeric(tree$tip.label[desc[desc<=length(tree$tip.label)]])
+      
+      ##score tips based off of input hybridizations
+      addition<-sum(desc %in% bfit[[i]]) ## tips that were identified by the input
+      subtract<-sum(!(desc %in% bfit[[i]])) ##tips that were not identified by the input
+      score<-addition-subtract ## score of node 
+      if(score>=bscore){
+        if(score==bscore && length(bclade_node[[i]][[j]]>desc)){
+        }
+        else{
+        bclade_tips[[i]][[j]]<-desc
+        bclade_node[[i]][[j]]<-k
+        bscore<-score
+        }
+      }
+    }
+  }
+}
+```
+
+
+Now let's look at the profile plots to compare the split rates of the control and clade-wise introgression.
+
+```{r}
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[1]]$mu.1,split_bound_control[[1]]$mu.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[1]]$mu.1,split_bound_clade[[1]]$mu.2),main="Clade",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_control[[1]]$lambda.1,split_bound_control[[1]]$lambda.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[1]]$lambda.1,split_bound_clade[[1]]$lambda.2),main="clade",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+
+
+```
+
+Well the rates don't look all that different within the groups, let's compare the control to the experimental.
+
+```{r}
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[1]]$lambda.1-split_bound_clade[[1]]$lambda.1),main="lambda1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[1]]$lambda.2-split_bound_clade[[1]]$lambda.2),main="lambda2",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[1]]$mu.1-split_bound_clade[[1]]$mu.1),main="mu1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[1]]$mu.2-split_bound_clade[[1]]$mu.2),main="mu2",col.line = c("red"),xlab = "control-clade")
+
+
+
+```
+
+
+Well from the first input tree it looks like the introgression has no effect on downstream analyses. Let's try looking at other trees
+
+
+###Tree 2
+
+```{r,include=FALSE}
+n<-2
+
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[n]]$mu.1,split_bound_control[[n]]$mu.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[n]]$mu.1,split_bound_clade[[n]]$mu.2),main="Clade",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.1,split_bound_control[[n]]$lambda.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[n]]$lambda.1,split_bound_clade[[n]]$lambda.2),main="clade",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.1-split_bound_clade[[n]]$lambda.1),main="lambda1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.2-split_bound_clade[[n]]$lambda.2),main="lambda2",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$mu.1-split_bound_clade[[n]]$mu.1),main="mu1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$mu.2-split_bound_clade[[n]]$mu.2),main="mu2",col.line = c("red"),xlab = "control-clade")
+
+
+
+```
+
+###Tree 3
+
+```{r,include=FALSE}
+n<-3
+
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[n]]$mu.1,split_bound_control[[n]]$mu.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[n]]$mu.1,split_bound_clade[[n]]$mu.2),main="Clade",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.1,split_bound_control[[n]]$lambda.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[n]]$lambda.1,split_bound_clade[[n]]$lambda.2),main="clade",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+
+
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.1-split_bound_clade[[n]]$lambda.1),main="lambda1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.2-split_bound_clade[[n]]$lambda.2),main="lambda2",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$mu.1-split_bound_clade[[n]]$mu.1),main="mu1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$mu.2-split_bound_clade[[n]]$mu.2),main="mu2",col.line = c("red"),xlab = "control-clade")
+
+```
+
+
+
+###Tree 4
+
+```{r,include=FALSE}
+n<-4
+
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[n]]$mu.1,split_bound_control[[n]]$mu.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[n]]$mu.1,split_bound_clade[[n]]$mu.2),main="Clade",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.1,split_bound_control[[n]]$lambda.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[n]]$lambda.1,split_bound_clade[[n]]$lambda.2),main="clade",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+
+
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.1-split_bound_clade[[n]]$lambda.1),main="lambda1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.2-split_bound_clade[[n]]$lambda.2),main="lambda2",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$mu.1-split_bound_clade[[n]]$mu.1),main="mu1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$mu.2-split_bound_clade[[n]]$mu.2),main="mu2",col.line = c("red"),xlab = "control-clade")
+
+```
+
+
+###Tree 5
+
+```{r,include=FALSE}
+n<-5
+
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[n]]$mu.1,split_bound_control[[n]]$mu.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[n]]$mu.1,split_bound_clade[[n]]$mu.2),main="Clade",col.line = c("blue","red"))
+legend("topright",c("mu1","mu2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.1,split_bound_control[[n]]$lambda.2),main="Control",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+profiles.plot(data.frame(split_bound_clade[[n]]$lambda.1,split_bound_clade[[n]]$lambda.2),main="clade",col.line = c("blue","red"))
+legend("topright",c("lambda1","lambda2"),text.col=c("blue","red"))
+
+
+
+par(mfrow=c(2,2))
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.1-split_bound_clade[[n]]$lambda.1),main="lambda1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$lambda.2-split_bound_clade[[n]]$lambda.2),main="lambda2",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$mu.1-split_bound_clade[[n]]$mu.1),main="mu1",col.line = c("red"),xlab = "control-clade")
+
+profiles.plot(data.frame(split_bound_control[[n]]$mu.2-split_bound_clade[[n]]$mu.2),main="mu2",col.line = c("red"),xlab = "control-clade")
+
+```
